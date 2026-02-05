@@ -1,15 +1,22 @@
 import yfinance as yf
 import pandas as pd
+import requests
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 import logging
+import io
 
 from app.models.stock import Stock
 from app.models.financial import FinancialStatement, DailyPrice
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Headers to avoid being blocked
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
 
 
 class DataFetcher:
@@ -23,28 +30,70 @@ class DataFetcher:
         """Fetch S&P 500 ticker list from Wikipedia."""
         try:
             url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-            tables = pd.read_html(url)
+            response = requests.get(url, headers=HEADERS, timeout=30)
+            response.raise_for_status()
+            tables = pd.read_html(io.StringIO(response.text))
             sp500_table = tables[0]
-            return sp500_table['Symbol'].str.replace('.', '-', regex=False).tolist()
+            tickers = sp500_table['Symbol'].str.replace('.', '-', regex=False).tolist()
+            logger.info(f"Fetched {len(tickers)} S&P 500 tickers")
+            return tickers
         except Exception as e:
             logger.error(f"Failed to fetch S&P 500 list: {e}")
-            return []
+            # Fallback to a static list of major stocks
+            return self._get_fallback_tickers()
 
     def get_nasdaq100_tickers(self) -> List[str]:
         """Fetch NASDAQ 100 ticker list."""
         try:
             url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-            tables = pd.read_html(url)
+            response = requests.get(url, headers=HEADERS, timeout=30)
+            response.raise_for_status()
+            tables = pd.read_html(io.StringIO(response.text))
             # Find the table with ticker symbols
             for table in tables:
                 if 'Ticker' in table.columns:
-                    return table['Ticker'].tolist()
+                    tickers = table['Ticker'].tolist()
+                    logger.info(f"Fetched {len(tickers)} NASDAQ 100 tickers")
+                    return tickers
                 elif 'Symbol' in table.columns:
-                    return table['Symbol'].tolist()
+                    tickers = table['Symbol'].tolist()
+                    logger.info(f"Fetched {len(tickers)} NASDAQ 100 tickers")
+                    return tickers
             return []
         except Exception as e:
             logger.error(f"Failed to fetch NASDAQ 100 list: {e}")
             return []
+
+    def _get_fallback_tickers(self) -> List[str]:
+        """Fallback list of major US stocks if Wikipedia fetch fails."""
+        return [
+            # Mega caps
+            'AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK-B', 'UNH',
+            'JPM', 'JNJ', 'V', 'XOM', 'PG', 'MA', 'HD', 'CVX', 'MRK', 'ABBV',
+            'LLY', 'PEP', 'COST', 'KO', 'AVGO', 'WMT', 'MCD', 'CSCO', 'TMO', 'ACN',
+            'ABT', 'DHR', 'NEE', 'LIN', 'ADBE', 'NKE', 'TXN', 'PM', 'UNP', 'RTX',
+            'ORCL', 'CRM', 'AMD', 'INTC', 'QCOM', 'IBM', 'AMGN', 'HON', 'LOW', 'SPGI',
+            # Large caps
+            'GE', 'BA', 'CAT', 'GS', 'BLK', 'AXP', 'SBUX', 'GILD', 'MDLZ', 'ADI',
+            'BKNG', 'ISRG', 'VRTX', 'REGN', 'SYK', 'ZTS', 'PLD', 'SCHW', 'CB', 'MMC',
+            'CI', 'SO', 'DUK', 'CME', 'BDX', 'CL', 'AON', 'ITW', 'NOC', 'SHW',
+            'PGR', 'EQIX', 'MO', 'APD', 'FCX', 'EMR', 'NSC', 'ETN', 'WM', 'MAR',
+            'PYPL', 'SQ', 'SHOP', 'SNOW', 'CRWD', 'DDOG', 'ZS', 'NET', 'PANW', 'FTNT',
+            # Tech
+            'CRM', 'NOW', 'INTU', 'AMAT', 'LRCX', 'KLAC', 'MRVL', 'MU', 'SNPS', 'CDNS',
+            # Finance
+            'MS', 'C', 'WFC', 'USB', 'PNC', 'TFC', 'COF', 'AIG', 'MET', 'PRU',
+            # Healthcare
+            'PFE', 'BMY', 'BIIB', 'MRNA', 'DXCM', 'IQV', 'EW', 'A', 'BAX', 'BIO',
+            # Consumer
+            'TGT', 'DG', 'DLTR', 'ROST', 'TJX', 'YUM', 'CMG', 'DPZ', 'DARDEN', 'HLT',
+            # Industrial
+            'DE', 'LMT', 'GD', 'MMM', 'FDX', 'UPS', 'CSX', 'PCAR', 'JCI', 'ROK',
+            # Energy
+            'COP', 'SLB', 'EOG', 'PXD', 'OXY', 'VLO', 'PSX', 'MPC', 'KMI', 'WMB',
+            # Other
+            'DIS', 'NFLX', 'CMCSA', 'T', 'VZ', 'TMUS', 'CHTR', 'EA', 'TTWO', 'ATVI',
+        ]
 
     def get_large_cap_stocks(self) -> List[Dict[str, Any]]:
         """Get all stocks with market cap > $1B from major exchanges."""
