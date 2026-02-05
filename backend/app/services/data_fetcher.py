@@ -6,6 +6,8 @@ from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 import logging
 import io
+import time
+import random
 
 from app.models.stock import Stock
 from app.models.financial import FinancialStatement, DailyPrice
@@ -17,6 +19,10 @@ logger = logging.getLogger(__name__)
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 }
+
+# Rate limiting settings
+REQUEST_DELAY = 1.0  # seconds between requests
+RATE_LIMIT_DELAY = 60  # seconds to wait when rate limited
 
 
 class DataFetcher:
@@ -109,13 +115,30 @@ class DataFetcher:
         logger.info(f"Found {len(tickers)} tickers to check")
 
         stocks = []
-        for ticker in tickers:
+        ticker_list = list(tickers)
+        for i, ticker in enumerate(ticker_list):
             try:
                 stock_info = self.fetch_stock_info(ticker)
                 if stock_info and stock_info.get('market_cap', 0) >= self.min_market_cap:
                     stocks.append(stock_info)
+                    logger.info(f"[{i+1}/{len(ticker_list)}] Added {ticker}")
+
+                # Rate limiting: add delay between requests
+                time.sleep(REQUEST_DELAY + random.uniform(0, 0.5))
+
             except Exception as e:
-                logger.warning(f"Failed to fetch {ticker}: {e}")
+                if '429' in str(e) or 'Too Many Requests' in str(e):
+                    logger.warning(f"Rate limited. Waiting {RATE_LIMIT_DELAY}s...")
+                    time.sleep(RATE_LIMIT_DELAY)
+                    # Retry once after waiting
+                    try:
+                        stock_info = self.fetch_stock_info(ticker)
+                        if stock_info and stock_info.get('market_cap', 0) >= self.min_market_cap:
+                            stocks.append(stock_info)
+                    except Exception:
+                        pass
+                else:
+                    logger.warning(f"Failed to fetch {ticker}: {e}")
                 continue
 
         logger.info(f"Found {len(stocks)} stocks with market cap >= ${self.min_market_cap:,.0f}")
@@ -393,12 +416,15 @@ class DataFetcher:
                     return float(val)
         return None
 
-    def refresh_stock_data(self, ticker: str) -> Optional[Stock]:
+    def refresh_stock_data(self, ticker: str, skip_info: bool = False, stock_info: Optional[Dict[str, Any]] = None) -> Optional[Stock]:
         """Refresh all data for a single stock."""
         logger.info(f"Refreshing data for {ticker}")
 
-        # Fetch and save stock info
-        stock_info = self.fetch_stock_info(ticker)
+        # Fetch and save stock info (or use provided info)
+        if not skip_info:
+            stock_info = self.fetch_stock_info(ticker)
+            time.sleep(REQUEST_DELAY)
+
         if not stock_info:
             logger.warning(f"Could not fetch info for {ticker}")
             return None
@@ -410,17 +436,25 @@ class DataFetcher:
         stock = self.save_stock(stock_info)
 
         # Fetch and save financial statements
-        statements = self.fetch_financial_statements(ticker)
-        if statements:
-            parsed = self.parse_financial_statements(ticker, statements)
-            for data in parsed:
-                period_type = data.pop('period_type')
-                self.save_financial_statement(stock.id, period_type, data)
+        try:
+            statements = self.fetch_financial_statements(ticker)
+            time.sleep(REQUEST_DELAY)
+            if statements:
+                parsed = self.parse_financial_statements(ticker, statements)
+                for data in parsed:
+                    period_type = data.pop('period_type')
+                    self.save_financial_statement(stock.id, period_type, data)
+        except Exception as e:
+            logger.warning(f"Could not fetch financials for {ticker}: {e}")
 
         # Fetch and save price history
-        history = self.fetch_price_history(ticker)
-        if not history.empty:
-            self.save_daily_prices(stock.id, history)
+        try:
+            history = self.fetch_price_history(ticker)
+            time.sleep(REQUEST_DELAY)
+            if not history.empty:
+                self.save_daily_prices(stock.id, history)
+        except Exception as e:
+            logger.warning(f"Could not fetch price history for {ticker}: {e}")
 
         logger.info(f"Successfully refreshed data for {ticker}")
         return stock
@@ -429,14 +463,29 @@ class DataFetcher:
         """Refresh data for all large-cap stocks."""
         stocks = self.get_large_cap_stocks()
         count = 0
+        total = len(stocks)
 
-        for stock_info in stocks:
+        for i, stock_info in enumerate(stocks):
             try:
-                result = self.refresh_stock_data(stock_info['ticker'])
+                logger.info(f"[{i+1}/{total}] Processing {stock_info['ticker']}...")
+                # Pass stock_info to avoid re-fetching
+                result = self.refresh_stock_data(
+                    stock_info['ticker'],
+                    skip_info=True,
+                    stock_info=stock_info
+                )
                 if result:
                     count += 1
+
+                # Extra delay between full refreshes
+                time.sleep(REQUEST_DELAY * 2)
+
             except Exception as e:
-                logger.error(f"Error refreshing {stock_info['ticker']}: {e}")
+                if '429' in str(e) or 'Too Many Requests' in str(e):
+                    logger.warning(f"Rate limited. Waiting {RATE_LIMIT_DELAY}s...")
+                    time.sleep(RATE_LIMIT_DELAY)
+                else:
+                    logger.error(f"Error refreshing {stock_info['ticker']}: {e}")
                 continue
 
         logger.info(f"Refreshed {count} stocks")
