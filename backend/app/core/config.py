@@ -16,6 +16,8 @@ class Settings(BaseSettings):
 
     # API Keys
     fmp_api_key: str = ""
+    finnhub_api_key: str = ""
+    alpha_vantage_api_key: str = ""
 
     # App
     debug: bool = True

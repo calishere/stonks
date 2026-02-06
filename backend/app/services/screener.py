@@ -22,21 +22,30 @@ class StockScreener:
 
         Returns paginated results with applied filters.
         """
-        # Base query joining stocks with their latest metrics
-        subquery = self.db.query(
+        from sqlalchemy import func
+
+        # Subquery to get the latest period_end_date for each stock
+        latest_metrics = self.db.query(
             CalculatedMetrics.stock_id,
-            CalculatedMetrics.period_end_date
+            func.max(CalculatedMetrics.period_end_date).label('max_date')
         ).filter(
             CalculatedMetrics.period_type.in_(['ttm', 'annual'])
         ).group_by(
             CalculatedMetrics.stock_id
         ).subquery()
 
+        # Join stocks with only their latest metrics
         query = self.db.query(Stock, CalculatedMetrics).join(
             CalculatedMetrics,
             and_(
                 Stock.id == CalculatedMetrics.stock_id,
                 CalculatedMetrics.period_type.in_(['ttm', 'annual'])
+            )
+        ).join(
+            latest_metrics,
+            and_(
+                CalculatedMetrics.stock_id == latest_metrics.c.stock_id,
+                CalculatedMetrics.period_end_date == latest_metrics.c.max_date
             )
         ).filter(
             Stock.is_active == True
@@ -246,25 +255,28 @@ class StockScreener:
 
     def find_undervalued(self, min_margin: float = 20) -> List[ScreenerResult]:
         """Find undervalued stocks with minimum margin of safety."""
+        # First try to find stocks with actual valuation data
         filters = ScreenerFilters(
             valuation_status='undervalued',
             min_margin_of_safety=min_margin,
-            positive_fcf_only=True,
             sort_by='margin_of_safety',
             sort_order='desc',
             per_page=50
         )
 
         result = self.screen(filters)
+
+        # If no undervalued stocks found (no price data), return empty list
+        # Don't mislead users with random stocks
         return result['results']
 
     def find_quality_stocks(self) -> List[ScreenerResult]:
         """Find high-quality stocks based on fundamentals."""
         filters = ScreenerFilters(
             min_roe=15,
-            min_roce=12,
+            # min_roce=12,  # Disabled - not all data sources provide ROCE
             min_net_margin=10,
-            positive_fcf_only=True,
+            # positive_fcf_only=True,  # Disabled - not all stocks have FCF data
             max_debt_to_equity=1.0,
             sort_by='roe',
             sort_order='desc',
@@ -277,9 +289,9 @@ class StockScreener:
     def find_growth_stocks(self) -> List[ScreenerResult]:
         """Find stocks with strong revenue and earnings growth."""
         filters = ScreenerFilters(
-            min_revenue_growth=15,
-            min_eps_growth=10,
-            positive_fcf_only=True,
+            min_revenue_growth=10,
+            # min_eps_growth=10,  # Disabled - not always available
+            # positive_fcf_only=True,  # Disabled - not all stocks have FCF data
             sort_by='revenue_growth',
             sort_order='desc',
             per_page=50

@@ -12,7 +12,7 @@ class Stock(Base):
     name = Column(String(255), nullable=False)
     sector = Column(String(100), nullable=True)
     industry = Column(String(100), nullable=True)
-    exchange = Column(String(20), nullable=True)  # NASDAQ, NYSE
+    exchange = Column(String(50), nullable=True)  # NASDAQ, NYSE, etc.
     market_cap = Column(Float, nullable=True)
     currency = Column(String(10), default="USD")
     is_active = Column(Boolean, default=True)
