@@ -1,4 +1,7 @@
-import finnhub
+try:
+    import finnhub
+except ModuleNotFoundError:  # pragma: no cover - depends on runtime image state
+    finnhub = None
 import yfinance as yf
 import pandas as pd
 import requests
@@ -41,8 +44,10 @@ class DataFetcher:
     def __init__(self, db: Session):
         self.db = db
         self.min_market_cap = settings.min_market_cap
-        self.finnhub_client = finnhub.Client(api_key=settings.finnhub_api_key)
+        self.finnhub_client = finnhub.Client(api_key=settings.finnhub_api_key) if finnhub else None
         self.alpha_vantage_key = settings.alpha_vantage_api_key
+        if not self.finnhub_client:
+            logger.warning("finnhub-python not installed; using fallback data providers where available.")
 
     def get_sp500_tickers(self) -> List[str]:
         """Fetch S&P 500 ticker list from Wikipedia."""
@@ -92,6 +97,9 @@ class DataFetcher:
 
     def fetch_stock_info(self, ticker: str) -> Optional[Dict[str, Any]]:
         """Fetch basic stock information from Finnhub."""
+        if not self.finnhub_client:
+            return self._fetch_stock_info_from_yfinance(ticker)
+
         try:
             # Get company profile
             profile = self.finnhub_client.company_profile2(symbol=ticker)
@@ -116,8 +124,34 @@ class DataFetcher:
             logger.error(f"Error fetching info for {ticker}: {e}")
             return None
 
+    def _fetch_stock_info_from_yfinance(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """Fallback stock profile fetch when Finnhub client is unavailable."""
+        try:
+            info = yf.Ticker(ticker).info or {}
+            market_cap = self._safe_float(info.get('marketCap'))
+
+            if not market_cap or market_cap <= 0:
+                logger.warning(f"No fallback market cap data for {ticker}")
+                return None
+
+            return {
+                'ticker': ticker.upper(),
+                'name': info.get('longName') or info.get('shortName') or ticker,
+                'sector': info.get('sector'),
+                'industry': info.get('industry'),
+                'exchange': info.get('exchange'),
+                'market_cap': market_cap,
+                'currency': info.get('currency', 'USD'),
+            }
+        except Exception as e:
+            logger.error(f"Fallback stock info fetch failed for {ticker}: {e}")
+            return None
+
     def fetch_financial_data(self, ticker: str) -> Dict[str, Any]:
         """Fetch financial metrics from Finnhub."""
+        if not self.finnhub_client:
+            return {}
+
         try:
             # Get basic financials (includes many key metrics)
             financials = self.finnhub_client.company_basic_financials(ticker, 'all')
@@ -133,6 +167,9 @@ class DataFetcher:
         Tries alternate tickers if the primary ticker has outdated or missing data.
         This handles cases like GOOG->GOOGL where company restructured.
         """
+        if not self.finnhub_client:
+            return []
+
         def get_latest_year(statements):
             """Get the most recent filing year from statements."""
             if not statements:
@@ -194,14 +231,15 @@ class DataFetcher:
 
     def get_current_price(self, ticker: str) -> Optional[float]:
         """Get current price for a stock."""
-        try:
-            # Try Finnhub first
-            quote = self.finnhub_client.quote(ticker)
-            price = quote.get('c')
-            if price and price > 0:
-                return price
-        except Exception as e:
-            logger.warning(f"Finnhub price fetch failed for {ticker}: {e}")
+        if self.finnhub_client:
+            try:
+                # Try Finnhub first
+                quote = self.finnhub_client.quote(ticker)
+                price = quote.get('c')
+                if price and price > 0:
+                    return price
+            except Exception as e:
+                logger.warning(f"Finnhub price fetch failed for {ticker}: {e}")
 
         # Fallback to yfinance
         try:

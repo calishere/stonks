@@ -3,7 +3,10 @@ from datetime import date, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 import logging
-import finnhub
+try:
+    import finnhub
+except ModuleNotFoundError:  # pragma: no cover - depends on runtime image state
+    finnhub = None
 
 from app.models.stock import Stock
 from app.models.financial import FinancialStatement, DailyPrice, CalculatedMetrics
@@ -28,10 +31,15 @@ class MetricsCalculator:
 
     def __init__(self, db: Session):
         self.db = db
-        self.finnhub_client = finnhub.Client(api_key=settings.finnhub_api_key)
+        self.finnhub_client = finnhub.Client(api_key=settings.finnhub_api_key) if finnhub else None
+        if not self.finnhub_client:
+            logger.warning("finnhub-python not installed; metrics will use historical-data fallbacks.")
 
     def _get_current_price_from_api(self, ticker: str) -> Optional[float]:
         """Fetch current price from Finnhub API."""
+        if not self.finnhub_client:
+            return None
+
         try:
             quote = self.finnhub_client.quote(ticker)
             price = quote.get('c')
@@ -49,6 +57,8 @@ class MetricsCalculator:
         This gives a more current FCF estimate than waiting for the next 10-K.
         """
         if not annual_eps or annual_eps <= 0:
+            return annual_fcf
+        if not self.finnhub_client:
             return annual_fcf
 
         try:
@@ -229,29 +239,30 @@ class MetricsCalculator:
         and floored at -5% (companies rarely sustain worse decline).
         """
         # Try to get growth rate from Finnhub basic financials
-        try:
-            financials = self.finnhub_client.company_basic_financials(ticker, 'all')
-            metrics = financials.get('metric', {})
+        if self.finnhub_client:
+            try:
+                financials = self.finnhub_client.company_basic_financials(ticker, 'all')
+                metrics = financials.get('metric', {})
 
-            # Prefer 5-year EPS growth as it's closer to FCF
-            eps_growth_5y = metrics.get('epsGrowth5Y')
-            revenue_growth_5y = metrics.get('revenueGrowth5Y')
+                # Prefer 5-year EPS growth as it's closer to FCF
+                eps_growth_5y = metrics.get('epsGrowth5Y')
+                revenue_growth_5y = metrics.get('revenueGrowth5Y')
 
-            if eps_growth_5y is not None:
-                # Convert from percentage to decimal
-                growth = eps_growth_5y / 100
-                logger.debug(f"{ticker}: Using Finnhub 5Y EPS growth: {growth*100:.1f}%")
-                return max(-0.05, min(0.12, growth))
+                if eps_growth_5y is not None:
+                    # Convert from percentage to decimal
+                    growth = eps_growth_5y / 100
+                    logger.debug(f"{ticker}: Using Finnhub 5Y EPS growth: {growth*100:.1f}%")
+                    return max(-0.05, min(0.12, growth))
 
-            if revenue_growth_5y is not None:
-                # Revenue growth is often higher than earnings growth
-                # Apply slight discount as FCF growth typically lags revenue
-                growth = (revenue_growth_5y / 100) * 0.85
-                logger.debug(f"{ticker}: Using Finnhub 5Y revenue growth (discounted): {growth*100:.1f}%")
-                return max(-0.05, min(0.12, growth))
+                if revenue_growth_5y is not None:
+                    # Revenue growth is often higher than earnings growth
+                    # Apply slight discount as FCF growth typically lags revenue
+                    growth = (revenue_growth_5y / 100) * 0.85
+                    logger.debug(f"{ticker}: Using Finnhub 5Y revenue growth (discounted): {growth*100:.1f}%")
+                    return max(-0.05, min(0.12, growth))
 
-        except Exception as e:
-            logger.warning(f"Could not fetch Finnhub growth metrics for {ticker}: {e}")
+            except Exception as e:
+                logger.warning(f"Could not fetch Finnhub growth metrics for {ticker}: {e}")
 
         # Fallback: Calculate from historical FCF data
         statements = self.db.query(FinancialStatement).filter(

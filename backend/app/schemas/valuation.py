@@ -50,6 +50,10 @@ class ValuationResponse(BaseModel):
 
     # Multiple-Based Valuations for comparison
     pe_based_value: Optional[float] = None
+    forward_pe_ratio: Optional[float] = None
+    forward_pe_based_value: Optional[float] = None
+    peg_ratio: Optional[float] = None
+    peg_based_value: Optional[float] = None
     pb_based_value: Optional[float] = None
     ps_based_value: Optional[float] = None
 

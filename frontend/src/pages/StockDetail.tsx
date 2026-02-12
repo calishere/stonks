@@ -5,7 +5,6 @@ import {
   ArrowLeft,
   Star,
   StarOff,
-  RefreshCw,
   TrendingUp,
   DollarSign,
   PieChart,
@@ -39,7 +38,7 @@ export default function StockDetail() {
     enabled: !!ticker,
   })
 
-  const { data: valuation, isLoading: loadingValuation } = useQuery({
+  const { data: valuation } = useQuery({
     queryKey: ['valuation', ticker],
     queryFn: () => valuationApi.get(ticker!),
     enabled: !!ticker,
@@ -296,10 +295,18 @@ export default function StockDetail() {
             <h3 className="text-sm font-medium text-gray-700 mb-3">
               Alternative Valuation Methods
             </h3>
-            <div className="grid grid-cols-3 gap-4">
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
               <MetricCard
                 label="P/E Based"
                 value={formatCurrency(valuation.pe_based_value)}
+              />
+              <MetricCard
+                label="Forward P/E Based"
+                value={formatCurrency(valuation.forward_pe_based_value)}
+              />
+              <MetricCard
+                label="PEG Based"
+                value={formatCurrency(valuation.peg_based_value)}
               />
               <MetricCard
                 label="P/B Based"
@@ -308,6 +315,17 @@ export default function StockDetail() {
               <MetricCard
                 label="P/S Based"
                 value={formatCurrency(valuation.ps_based_value)}
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-4 mt-4">
+              <MetricCard
+                label="Forward P/E"
+                value={formatNumber(valuation.forward_pe_ratio)}
+              />
+              <MetricCard
+                label="PEG"
+                value={formatNumber(valuation.peg_ratio)}
               />
             </div>
           </div>

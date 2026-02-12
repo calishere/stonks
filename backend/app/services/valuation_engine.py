@@ -1,5 +1,4 @@
-from typing import Optional, Dict, Any, List
-from datetime import date
+from typing import Optional, Dict, Any, List, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 import logging
@@ -21,6 +20,8 @@ class ValuationEngine:
     DEFAULT_PROJECTION_YEARS = 10
     RISK_FREE_RATE = 0.04  # 4% risk-free rate
     MARKET_RISK_PREMIUM = 0.06  # 6% market risk premium
+    MIN_GROWTH_RATE = -0.10
+    MAX_GROWTH_RATE = 0.30
 
     def __init__(self, db: Session):
         self.db = db
@@ -72,12 +73,16 @@ class ValuationEngine:
 
         market_cap = current_price * shares
 
+        projected_earnings_growth = None
+        historical_fcf_growth = None
+
         # Determine growth rate
         if growth_rate is None:
-            growth_rate = self._estimate_growth_rate(stock.id)
+            growth_rate, projected_earnings_growth, historical_fcf_growth = self._estimate_growth_rate(stock.id)
 
         # Cap growth rate to reasonable bounds
-        growth_rate = max(-0.10, min(0.30, growth_rate))  # -10% to 30%
+        growth_rate = self._bound_growth(growth_rate)
+        base_growth_rate = growth_rate
 
         # Use default or provided discount rate
         if discount_rate is None:
@@ -93,14 +98,16 @@ class ValuationEngine:
         # Calculate DCF projections
         projections = []
         total_pv = 0
+        projected_fcf = latest_fcf
+        working_growth_rate = growth_rate
 
         for year in range(1, projection_years + 1):
             # Project FCF with growth
-            projected_fcf = latest_fcf * ((1 + growth_rate) ** year)
+            projected_fcf = projected_fcf * (1 + working_growth_rate)
 
             # Decay growth rate over time (mean reversion)
             if year > 5:
-                growth_rate = growth_rate * 0.9  # Reduce growth assumption
+                working_growth_rate = working_growth_rate * 0.9  # Reduce growth assumption
 
             # Discount factor
             discount_factor = 1 / ((1 + discount_rate) ** year)
@@ -118,7 +125,7 @@ class ValuationEngine:
             total_pv += pv
 
         # Terminal value (Gordon Growth Model)
-        final_fcf = projections[-1]['projected_fcf']
+        final_fcf = projected_fcf
         terminal_value = (final_fcf * (1 + terminal_growth_rate)) / (discount_rate - terminal_growth_rate)
         terminal_value_pv = terminal_value / ((1 + discount_rate) ** projection_years)
 
@@ -147,11 +154,23 @@ class ValuationEngine:
         # Generate summary
         summary = self._generate_summary(
             ticker, current_price, fair_value_per_share,
-            margin_of_safety, valuation_status, growth_rate
+            margin_of_safety, valuation_status, base_growth_rate, projected_earnings_growth, historical_fcf_growth
         )
 
         # Calculate alternative valuations for comparison
-        pe_value = self._calculate_pe_based_value(stock.id, current_price, shares)
+        pe_value = self._calculate_pe_based_value(stock.id, shares)
+        forward_pe_ratio, forward_pe_value = self._calculate_forward_pe_based_value(
+            stock.id,
+            current_price,
+            shares,
+            projected_earnings_growth
+        )
+        peg_ratio, peg_value = self._calculate_peg_based_value(
+            stock.id,
+            current_price,
+            shares,
+            projected_earnings_growth
+        )
         pb_value = self._calculate_pb_based_value(stock.id, shares)
         ps_value = self._calculate_ps_based_value(stock.id, shares)
 
@@ -168,7 +187,7 @@ class ValuationEngine:
             'market_cap': round(market_cap, 2),
 
             'latest_fcf': round(latest_fcf, 2),
-            'estimated_growth_rate': round(growth_rate * 100, 2),  # As percentage
+            'estimated_growth_rate': round(base_growth_rate * 100, 2),  # As percentage
             'discount_rate': round(discount_rate * 100, 2),
             'terminal_growth_rate': round(terminal_growth_rate * 100, 2),
             'projection_years': projection_years,
@@ -186,6 +205,10 @@ class ValuationEngine:
             'valuation_status': valuation_status,
 
             'pe_based_value': pe_value,
+            'forward_pe_ratio': forward_pe_ratio,
+            'forward_pe_based_value': forward_pe_value,
+            'peg_ratio': peg_ratio,
+            'peg_based_value': peg_value,
             'pb_based_value': pb_value,
             'ps_based_value': ps_value,
 
@@ -247,20 +270,51 @@ class ValuationEngine:
 
         return total_debt - cash
 
-    def _estimate_growth_rate(self, stock_id: int) -> float:
-        """Estimate future growth rate based on historical data."""
-        # Get historical FCF growth
+    def _estimate_growth_rate(self, stock_id: int) -> Tuple[float, Optional[float], Optional[float]]:
+        """
+        Estimate forward growth with a blend of historical FCF and projected earnings growth.
+
+        Returns:
+            tuple: (blended_growth_rate, projected_earnings_growth, historical_fcf_growth)
+        """
+        historical_fcf_growth = self._estimate_historical_fcf_growth(stock_id)
+        projected_earnings_growth = self._estimate_projected_earnings_growth(stock_id)
+
+        if historical_fcf_growth is not None and projected_earnings_growth is not None:
+            # Slightly overweight projected earnings to make fair value more forward-looking.
+            blended = (historical_fcf_growth * 0.45) + (projected_earnings_growth * 0.55)
+            return self._bound_growth(blended), projected_earnings_growth, historical_fcf_growth
+
+        if projected_earnings_growth is not None:
+            return self._bound_growth(projected_earnings_growth), projected_earnings_growth, None
+
+        if historical_fcf_growth is not None:
+            return self._bound_growth(historical_fcf_growth), None, historical_fcf_growth
+
+        # Fall back to revenue growth when FCF/EPS data is not available
+        revenue_growth = self._estimate_revenue_growth(stock_id)
+        if revenue_growth is not None:
+            return self._bound_growth(revenue_growth), None, None
+
+        # Default moderate growth
+        return 0.08, None, None  # 8% default
+
+    def _estimate_historical_fcf_growth(self, stock_id: int) -> Optional[float]:
+        """Estimate growth rate from historical FCF performance."""
         metrics = self.db.query(CalculatedMetrics).filter(
             CalculatedMetrics.stock_id == stock_id,
             CalculatedMetrics.fcf_growth.isnot(None)
         ).order_by(desc(CalculatedMetrics.period_end_date)).limit(5).all()
 
         if metrics:
-            avg_fcf_growth = np.mean([m.fcf_growth for m in metrics if m.fcf_growth])
+            avg_fcf_growth = np.mean([m.fcf_growth for m in metrics if m.fcf_growth is not None])
             # Convert from percentage to decimal and apply margin
             return (avg_fcf_growth / 100) * 0.8  # Conservative 80% of historical
 
-        # Fall back to revenue growth
+        return None
+
+    def _estimate_revenue_growth(self, stock_id: int) -> Optional[float]:
+        """Estimate growth rate from historical revenue when FCF/EPS is unavailable."""
         revenue_metrics = self.db.query(CalculatedMetrics).filter(
             CalculatedMetrics.stock_id == stock_id,
             CalculatedMetrics.revenue_growth.isnot(None)
@@ -270,8 +324,59 @@ class ValuationEngine:
             avg_revenue_growth = np.mean([m.revenue_growth for m in revenue_metrics])
             return (avg_revenue_growth / 100) * 0.7  # Even more conservative
 
-        # Default moderate growth
-        return 0.08  # 8% default
+        return None
+
+    def _estimate_projected_earnings_growth(self, stock_id: int) -> Optional[float]:
+        """
+        Estimate forward earnings growth using recent EPS trend and multi-year EPS CAGR.
+
+        This is a projection signal (not just historical FCF), then blended into DCF growth.
+        """
+        growth_signals: List[float] = []
+        weights: List[float] = []
+
+        # Signal 1: TTM EPS momentum (latest 4 quarters vs prior 4 quarters)
+        quarters = self.db.query(FinancialStatement).filter(
+            FinancialStatement.stock_id == stock_id,
+            FinancialStatement.period_type == 'quarterly',
+            FinancialStatement.earnings_per_share.isnot(None)
+        ).order_by(desc(FinancialStatement.period_end_date)).limit(8).all()
+
+        if len(quarters) >= 8:
+            latest_ttm_eps = sum(q.earnings_per_share or 0 for q in quarters[:4])
+            prior_ttm_eps = sum(q.earnings_per_share or 0 for q in quarters[4:8])
+
+            if latest_ttm_eps > 0 and prior_ttm_eps > 0:
+                ttm_eps_growth = (latest_ttm_eps - prior_ttm_eps) / prior_ttm_eps
+                growth_signals.append(ttm_eps_growth)
+                weights.append(0.6)
+
+        # Signal 2: Multi-year annual EPS CAGR
+        annual_eps = self.db.query(FinancialStatement).filter(
+            FinancialStatement.stock_id == stock_id,
+            FinancialStatement.period_type == 'annual',
+            FinancialStatement.earnings_per_share.isnot(None)
+        ).order_by(desc(FinancialStatement.period_end_date)).limit(4).all()
+
+        if len(annual_eps) >= 2:
+            latest_eps = annual_eps[0].earnings_per_share
+            oldest_eps = annual_eps[-1].earnings_per_share
+            years = annual_eps[0].fiscal_year - annual_eps[-1].fiscal_year
+
+            if latest_eps and oldest_eps and latest_eps > 0 and oldest_eps > 0 and years > 0:
+                eps_cagr = (latest_eps / oldest_eps) ** (1 / years) - 1
+                growth_signals.append(eps_cagr)
+                weights.append(0.4)
+
+        if not growth_signals:
+            return None
+
+        projected_growth = float(np.average(growth_signals, weights=weights))
+        return self._bound_growth(projected_growth)
+
+    def _bound_growth(self, growth_rate: float) -> float:
+        """Bound growth assumptions to avoid extreme valuation outputs."""
+        return max(self.MIN_GROWTH_RATE, min(self.MAX_GROWTH_RATE, growth_rate))
 
     def _estimate_wacc(self, stock_id: int) -> float:
         """Estimate Weighted Average Cost of Capital."""
@@ -296,11 +401,22 @@ class ValuationEngine:
     def _calculate_pe_based_value(
         self,
         stock_id: int,
-        current_price: float,
         shares: float
     ) -> Optional[float]:
         """Calculate fair value based on P/E ratio."""
-        # Get average historical P/E
+        avg_pe = self._get_historical_avg_pe(stock_id)
+        if avg_pe is None:
+            return None
+
+        eps = self._get_ttm_eps(stock_id, shares)
+        if eps is None or eps <= 0:
+            return None
+
+        fair_value = eps * avg_pe
+        return round(fair_value, 2)
+
+    def _get_historical_avg_pe(self, stock_id: int) -> Optional[float]:
+        """Get median historical P/E ratio for valuation multiples."""
         metrics = self.db.query(CalculatedMetrics).filter(
             CalculatedMetrics.stock_id == stock_id,
             CalculatedMetrics.pe_ratio.isnot(None),
@@ -311,9 +427,10 @@ class ValuationEngine:
         if not metrics:
             return None
 
-        avg_pe = np.median([m.pe_ratio for m in metrics])
+        return float(np.median([m.pe_ratio for m in metrics]))
 
-        # Get current EPS
+    def _get_ttm_eps(self, stock_id: int, shares: float) -> Optional[float]:
+        """Get trailing-twelve-month EPS from the latest quarterly statements."""
         quarters = self.db.query(FinancialStatement).filter(
             FinancialStatement.stock_id == stock_id,
             FinancialStatement.period_type == 'quarterly'
@@ -324,12 +441,89 @@ class ValuationEngine:
 
         ttm_earnings = sum(q.net_income or 0 for q in quarters)
         if ttm_earnings <= 0:
+            # Fallback to reported EPS if net income isn't available/positive.
+            ttm_eps = sum(q.earnings_per_share or 0 for q in quarters)
+            return ttm_eps if ttm_eps > 0 else None
+
+        return ttm_earnings / shares
+
+    def _estimate_next_year_eps(
+        self,
+        stock_id: int,
+        shares: float,
+        projected_earnings_growth: Optional[float] = None
+    ) -> Optional[Tuple[float, float]]:
+        """Estimate next-year EPS using projected earnings growth."""
+        ttm_eps = self._get_ttm_eps(stock_id, shares)
+        if ttm_eps is None or ttm_eps <= 0:
             return None
 
-        eps = ttm_earnings / shares
-        fair_value = eps * avg_pe
+        if projected_earnings_growth is None:
+            projected_earnings_growth = self._estimate_projected_earnings_growth(stock_id)
 
-        return round(fair_value, 2)
+        if projected_earnings_growth is None:
+            return None
+
+        projected_earnings_growth = self._bound_growth(projected_earnings_growth)
+        next_year_eps = ttm_eps * (1 + projected_earnings_growth)
+
+        if next_year_eps <= 0:
+            return None
+
+        return next_year_eps, projected_earnings_growth
+
+    def _calculate_forward_pe_based_value(
+        self,
+        stock_id: int,
+        current_price: float,
+        shares: float,
+        projected_earnings_growth: Optional[float] = None
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Calculate forward P/E ratio and forward-P/E-based fair value.
+
+        Fair value = next-year EPS * historical median P/E.
+        """
+        avg_pe = self._get_historical_avg_pe(stock_id)
+        next_year = self._estimate_next_year_eps(stock_id, shares, projected_earnings_growth)
+
+        if avg_pe is None or next_year is None:
+            return None, None
+
+        next_year_eps, _ = next_year
+        forward_pe_ratio = current_price / next_year_eps
+        fair_value = next_year_eps * avg_pe
+
+        return round(forward_pe_ratio, 2), round(fair_value, 2)
+
+    def _calculate_peg_based_value(
+        self,
+        stock_id: int,
+        current_price: float,
+        shares: float,
+        projected_earnings_growth: Optional[float] = None
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Calculate PEG ratio and PEG-based fair value.
+
+        PEG ratio uses forward P/E divided by projected EPS growth (in % terms).
+        PEG-based fair value assumes PEG=1 (target forward P/E equals growth rate %).
+        """
+        next_year = self._estimate_next_year_eps(stock_id, shares, projected_earnings_growth)
+        if next_year is None:
+            return None, None
+
+        next_year_eps, growth_rate = next_year
+        growth_percent = growth_rate * 100
+
+        if growth_percent <= 0:
+            return None, None
+
+        forward_pe_ratio = current_price / next_year_eps
+        peg_ratio = forward_pe_ratio / growth_percent
+        peg_based_value = next_year_eps * growth_percent
+
+        return round(peg_ratio, 2), round(peg_based_value, 2)
 
     def _calculate_pb_based_value(
         self,
@@ -403,28 +597,37 @@ class ValuationEngine:
         fair_value: float,
         margin_of_safety: float,
         valuation_status: str,
-        growth_rate: float
+        growth_rate: float,
+        projected_earnings_growth: Optional[float] = None,
+        historical_fcf_growth: Optional[float] = None
     ) -> str:
         """Generate a human-readable valuation summary."""
+        growth_basis = (
+            f"This assumes a blended growth rate of {growth_rate*100:.1f}% annually "
+            f"based on projected earnings and historical cash-flow trends."
+            if projected_earnings_growth is not None and historical_fcf_growth is not None
+            else f"This assumes a growth rate of {growth_rate*100:.1f}% annually."
+        )
+
         if valuation_status == "undervalued":
             return (
                 f"{ticker} appears undervalued with a fair value of ${fair_value:.2f} "
                 f"compared to current price of ${current_price:.2f} "
                 f"(potential upside of {margin_of_safety:.1f}%). "
-                f"This assumes a growth rate of {growth_rate*100:.1f}% annually."
+                f"{growth_basis}"
             )
         elif valuation_status == "overvalued":
             return (
                 f"{ticker} appears overvalued at ${current_price:.2f} "
                 f"compared to fair value estimate of ${fair_value:.2f} "
                 f"(potential downside of {abs(margin_of_safety):.1f}%). "
-                f"Consider waiting for a better entry point."
+                f"{growth_basis}"
             )
         else:
             return (
                 f"{ticker} appears fairly valued at ${current_price:.2f} "
                 f"with fair value estimate of ${fair_value:.2f}. "
-                f"The stock is trading close to its intrinsic value."
+                f"The stock is trading close to its intrinsic value. {growth_basis}"
             )
 
     def _save_valuation_metrics(

@@ -134,6 +134,10 @@ export interface Valuation {
   margin_of_safety: number
   valuation_status: string
   pe_based_value: number | null
+  forward_pe_ratio: number | null
+  forward_pe_based_value: number | null
+  peg_ratio: number | null
+  peg_based_value: number | null
   pb_based_value: number | null
   ps_based_value: number | null
   valuation_summary: string
